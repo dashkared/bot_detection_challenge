@@ -17,6 +17,8 @@
 - bot_flags: ручные эвристические флаги
 - cross_cookie_feats: частоты UA/item и сглаженный bot-rate по train
 
+- cross_cookie_feats: частоты UA/item в train+test (БЕЗ лейблов — это частота, не утечка)
+
 Все функции возвращают DataFrame с колонкой cookie_id и дополнительными фичами.
 """
 import re
@@ -583,70 +585,49 @@ def bot_flags(X, meta):
 
 
 def cross_cookie_feats(ev_tr, ev_te, meta_tr, X_all):
-    """Кросс-cookie фичи по user_agent и item_id.
+    """Frequency-only кросс-cookie фичи по user_agent и item_id.
 
-    Идея: если такой же UA или item_id уже встречался у ботов в train,
-    то и новая кука скорее всего бот. Это самый сильный сигнал в датасете.
+    Считаем частоту встречаемости UA и item_id во всех событиях (train+test).
+    Это НЕ утечка: мы не используем train-лейблы, только сам факт частотности.
 
-    Считаем только по train labels (target test-кук нам недоступен).
-    Для test делаем честный lookup по тем же статистикам.
+    Важно: ранние версии этой функции возвращали ua_bot_rate и item_bot_rate_smooth
+    (доля ботов по UA/item_id), которые давали утечку через train-лейблы.
+    Теперь они УБРАНЫ. Остались только frequency-фичи.
 
     Колонки:
-        ua_count: сколько train+test кук используют этот UA
+        ua_count: сколько кук в train+test используют этот UA
         ua_log_count: log1p(ua_count)
-        ua_bot_rate: доля ботов среди train-кук с этим UA (без сглаживания)
-        ua_bot_rate_smooth: то же со сглаживанием к глобальной доле (beta=5)
-            (rate * n + global_rate * 5) / (n + 5)
-            Сглаживание нужно чтобы редкие UA не давали шумовые 0/1.
         item_count: сколько раз item_id встречается во всех событиях
         item_log_count: log1p(item_count)
-        item_bot_rate_smooth: сглаженный bot-rate среди train-кук по item_id
 
-    Почему pool для подсчёта ua_count = train+test, а для bot_rate = только train:
-    - нам не нужно знать target test-кук, но мы хотим корректный счётчик
-      частоты UA во всём датасете (это не утечка, это публичная статистика).
+    Идея: популярные UA / item_id у ботов — это частый паттерн. Даже без лейблов,
+    частотность коррелирует с ботоводством.
     """
     ev_all = pd.concat([ev_tr, ev_te], ignore_index=True)
-    global_rate = float(meta_tr.target.mean())
 
-    # --- по user_agent ---
-    df = ev_all.merge(meta_tr[["cookie_id", "target"]], on="cookie_id", how="left")
+    # --- по user_agent: считаем сколько УНИКАЛЬНЫХ кук используют каждый UA
+    # Берём самую частую пару cookie_id -> user_agent
     top_ua = (
-        df.groupby(["cookie_id", "user_agent"]).size()
+        ev_all.groupby(["cookie_id", "user_agent"]).size()
         .reset_index(name="n")
         .sort_values(["cookie_id", "n"], ascending=[True, False])
         .drop_duplicates("cookie_id")[["cookie_id", "user_agent"]]
     )
-    top_ua = top_ua.merge(meta_tr[["cookie_id", "target"]], on="cookie_id", how="left")
-    ua_stats = (
-        top_ua.groupby("user_agent")
-        .agg(ua_count=("cookie_id", "size"), ua_bot_rate=("target", "mean"))
-        .reset_index()
+    ua_count_df = (
+        top_ua.groupby("user_agent").size()
+        .rename("ua_count").reset_index()
     )
-    # сглаживание к глобальной доле ботов (beta=5): для редких UA не уходим в 0/1
-    ua_stats["ua_bot_rate_smooth"] = (
-        (ua_stats.ua_bot_rate * ua_stats.ua_count + global_rate * 5)
-        / (ua_stats.ua_count + 5)
-    )
+    ua_count_df["ua_log_count"] = np.log1p(ua_count_df["ua_count"])
 
-    # --- по item_id ---
-    item_freq = ev_all.groupby("item_id").size().rename("item_count").reset_index()
-    item_freq["item_log_count"] = np.log1p(item_freq["item_count"])
-    df2 = ev_all.merge(meta_tr[["cookie_id", "target"]], on="cookie_id")
-    item_freq_bot = (
-        df2.dropna(subset=["item_id"])
-        .groupby(["item_id", "target"]).size().unstack(fill_value=0)
+    # --- по item_id: считаем частоту item_id во всех событиях
+    item_count_df = (
+        ev_all.dropna(subset=["item_id"])
+        .groupby("item_id").size()
+        .rename("item_count").reset_index()
     )
-    if 1 in item_freq_bot.columns and 0 in item_freq_bot.columns:
-        item_freq_bot["item_bot_rate_smooth"] = (
-            (item_freq_bot[1] + global_rate * 5)
-            / (item_freq_bot[1] + item_freq_bot[0] + 5)
-        )
-    else:
-        item_freq_bot["item_bot_rate_smooth"] = global_rate
-    item_freq_bot = item_freq_bot.reset_index()[["item_id", "item_bot_rate_smooth"]]
+    item_count_df["item_log_count"] = np.log1p(item_count_df["item_count"])
 
-    # маппинг cookie -> top UA и top item
+    # --- маппинг cookie -> top UA и top item ---
     top_item = (
         ev_all.sort_values(["cookie_id", "event_ts"])
         .dropna(subset=["item_id"])
@@ -654,22 +635,15 @@ def cross_cookie_feats(ev_tr, ev_te, meta_tr, X_all):
     )
 
     X2 = X_all.merge(top_ua[["cookie_id", "user_agent"]], on="cookie_id", how="left")
-    X2 = X2.merge(ua_stats, on="user_agent", how="left")
+    X2 = X2.merge(ua_count_df, on="user_agent", how="left")
     X2 = X2.merge(top_item, on="cookie_id", how="left")
-    X2 = X2.merge(item_freq, on="item_id", how="left")
-    X2 = X2.merge(item_freq_bot, on="item_id", how="left")
+    X2 = X2.merge(item_count_df, on="item_id", how="left")
 
-    X2["ua_log_count"] = np.log1p(X2["ua_count"].fillna(0))
-    # числовые счётчики заполняем 0, долевые - глобальной средней
+    # заполняем NaN нулями (куки без UA или item_id)
     for c in ["ua_count", "ua_log_count", "item_count", "item_log_count"]:
         X2[c] = X2[c].fillna(0)
-    for c in ["ua_bot_rate", "ua_bot_rate_smooth", "item_bot_rate_smooth"]:
-        X2[c] = X2[c].fillna(global_rate)
 
-    return X2[[
-        "cookie_id", "ua_count", "ua_log_count", "ua_bot_rate", "ua_bot_rate_smooth",
-        "item_count", "item_log_count", "item_bot_rate_smooth",
-    ]]
+    return X2[["cookie_id", "ua_count", "ua_log_count", "item_count", "item_log_count"]]
 
 
 def build_xy(ev_tr, ev_te, train, test):
@@ -679,8 +653,8 @@ def build_xy(ev_tr, ev_te, train, test):
     1. Для каждой группы фич (basic/timing/event_mix/platform/search/diversity/pointer/ua/meta/behavior)
        считаем их на train и test отдельно.
     2. Добавляем bot_flags поверх объединённых фич.
-    3. Считаем cross_cookie_feats на объединении событий train+test,
-       но с использованием только train target (test target недоступен).
+    3. Добавляем 4 frequency-only cross-cookie фичи (ua_count, ua_log_count,
+       item_count, item_log_count) — считаются по train+test без train-лейблов.
     4. Выравниваем набор колонок train и test (могут различаться из-за разного
        разнообразия категорий/UA), fillna(0).
 
