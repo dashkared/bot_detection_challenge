@@ -1,7 +1,6 @@
 # данные - их нужно положить самостоятельно
 data/
 PREPROCESSING.md
-sample_submission.csv
 
 __pycache__/
 *.pyc
