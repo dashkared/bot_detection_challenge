@@ -16,7 +16,7 @@
 ├── notebooks/
 │   ├── 01_eda.ipynb               # разведка данных
 │   ├── 02_experiments.ipynb       # история экспериментов с фичами
-│   └── 03_final_solution.ipynb          # финальное решение (главный)
+│   └── 03_final_solution.ipynb    # финальное решение (главный)
 ├── output/
 │   └── submission.csv             # предсказания (пересоздаётся запуском 03)
 ├── features.py                    # все функции построения фич
