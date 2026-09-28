@@ -1,16 +1,10 @@
 # данные - их нужно положить самостоятельно
 data/
 PREPROCESSING.md
-
-__pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# мусор macOS
 .DS_Store
-
-# IDE
 .vscode/
 .idea/
 
